@@ -1,0 +1,260 @@
+---
+title: "classIDproject"
+author: "Yanping"
+date: "2025-11-11"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## dRCT
+```{r}
+# loading and preprocessing
+setwd("/Users/ypei/dRCT")
+devtools::load_all("/Users/ypei/dRCT")
+library(dRCT)
+library(lmtest)
+library(sandwich)
+```
+
+```{r}
+# data
+data <- read.csv("/Users/ypei/Research/2526/LLMteacher/tmp_spacing_non_experimental_mastery_speed_202111160946.csv")
+
+colnames(data) 
+# xtabs(~student_class_id+user_id,data=data)
+```
+
+```{r}
+data %>%
+  count(student_class_id) %>% 
+  filter(n == 1) %>% 
+  nrow()
+singleton_classes <- data %>%
+  count(student_class_id) %>% 
+  filter(n == 1)
+singleton_classes
+class_sizes <- data %>%
+  count(student_class_id, name = "num_students")
+summary(class_sizes)
+```
+
+```{r}
+data$student_class_id = as.factor(data$student_class_id)
+olsFixed = lm(inv_mastery_speed ~ prior_percent_correct + student_class_id, data = data)
+coeftest(olsFixed, vcov = vcovHC(olsFixed, type = "HC1"))
+```
+
+
+## data preprocessing
+$$true\_outcome = class\_coef + (.16\times prior\_percent\_correct) + (effect\_size\times condition) + eta$$
+# data propressing
+```{r}
+library(dplyr)
+library(lme4)
+
+#rm(list=ls())
+set.seed(123)
+
+################################################################################
+### Data loading and sampling
+################################################################################
+# read in 'remnant' data and separate working samples from holdout
+df <- data
+samples <- unique(df$sample)
+sandbox_samples <- sample(samples,as.integer(length(samples)*.5))
+sandbox <- df %>% filter(sample %in% sandbox_samples)
+holdout <- df %>% filter(!(sample %in% sandbox_samples))
+
+# create a dataframe of class features for all classes in the working set
+sandbox_classes <- sandbox %>% group_by(student_class_id) %>%
+                    summarize(class_size = length(unique(user_id)), # why need unique?
+                              class_percent_correct = mean(prior_percent_correct),
+                              class_completion = mean(prior_completion))
+
+# examine distribution of class size
+hist(sandbox_classes$class_size, breaks=50, col="red")
+sandbox_classes %>% group_by(class_size) %>% summarize(n=n()) %>% mutate(proportion = n/sum(n))
+
+################################################################################
+### Calculation of residual distributions
+################################################################################
+# traditional ols
+formula_base <- inv_mastery_speed ~ prior_percent_correct
+# ols with class as a fixed effect
+formula_ols <- inv_mastery_speed ~ prior_percent_correct + as.factor(student_class_id)
+# mixed effect model with class as a random effect
+formula_hlm <- inv_mastery_speed ~ prior_percent_correct + (1|student_class_id)
+
+mod_base <- lm(formula_base, data=sandbox)
+mod_ols <- lm(formula_ols, data=sandbox)
+mod_hlm <- lmer(formula_hlm, data=sandbox)
+
+# examine magnitude of coef for prior percent correct 
+# (to set a reasonable value for simulation)
+pc_coef_base <- coef(mod_base)[2]
+pc_coef_ols <- coef(mod_ols)[2]
+pc_coef_hlm <- coef(mod_hlm)$student_class_id$prior_percent_correct[1]
+
+# compare the residual distributions for each model
+par(mfrow=c(1,3))
+hist(mod_base$residuals, c='red', breaks=50)
+hist(mod_ols$residuals, c='red', breaks=50)
+hist(residuals(mod_hlm), c='red', breaks=50)
+
+base_eta <- mod_base$residuals
+ols_eta <- mod_ols$residuals
+hlm_eta <- residuals(mod_hlm)
+
+################################################################################
+### Generate class-level attributes for simulation
+################################################################################
+class_df <- data.frame(student_class_id=as.numeric(levels(mod_hlm@flist$student_class_id)),
+                       coef=coef(mod_ols)[c(1,3:length(coef(mod_ols)))])
+class_df <- merge(class_df, sandbox_classes)
+
+# Examine distribution of class coefficients from OLS with Class fixed effects
+par(mfrow=c(1,2))
+hist(class_df$coef, c='red', breaks=50)
+qqplot(class_df$coef,rnorm(1000))
+par(mfrow=c(1,1))
+plot(class_df$coef, class_df$class_percent_correct)
+cor(class_df$coef, class_df$class_percent_correct,"complete.obs")
+```
+
+
+
+## data generating
+```{r}
+################################################################################
+### Define function for generating simulated data frame
+################################################################################
+generate_set <- function(sample_df, n_classes, effect_size=0.2, class_df, etas, seed=0) {
+  set.seed(seed)
+  sim_classes <- data.frame(student_class_id = sample(unique(sample_df$student_class_id), n_classes, replace=TRUE),
+                            sim_class_id = seq(1,n_classes,1))
+  
+  sim_df <- merge(sim_classes, sample_df)
+  
+  sampled_classes <- sample(c(1:nrow(class_df)),length(unique(sim_df$sim_class_id)),
+                            replace=TRUE)
+  class_levels <- data.frame(sim_class_id=unique(sim_df$sim_class_id),
+                             class_coef=class_df$coef[sampled_classes],
+                             class_percent_correct=class_df$class_percent_correct[sampled_classes])
+  sim_df <- merge(sim_df, class_levels)
+  sim_df$eta <- sample(etas[!is.nan(etas)],nrow(sim_df),replace=TRUE)
+  sim_df$condition <- rbinom(n=nrow(sim_df),1,0.5)
+  sim_df <- sim_df %>% mutate(true_outcome = class_coef + .16*prior_percent_correct - (prior_percent_correct>class_coef) + (prior_percent_correct<class_coef) + (effect_size*condition) + eta)
+  # sim_df <- sim_df %>% mutate(true_outcome = class_coef + (.16*prior_percent_correct) +  (effect_size*condition) + eta)
+  # sim_df <- sim_df %>% mutate(true_outcome = class_coef + sin(0.16 * prior_percent_correct) + effect_size*condition + eta)
+  return(sim_df)
+} 
+```
+
+## sim
+```{r}
+sim <- generate_set(
+  sample_df = sandbox,
+  n_classes = 200,
+  effect_size = 0.2,
+  class_df = class_df,
+  etas = hlm_eta,
+  seed = 123
+)
+```
+
+# run
+```{r}
+ttest <- lm(
+  true_outcome ~ condition,
+  data = sim
+)
+coefs <- summary(ttest)$coefficients
+coefs[grep("condition", rownames(coefs)), "Std. Error"]
+
+modFixedCovs <- lm(
+  true_outcome ~ student_class_id
+  + condition
+  + prior_percent_correct,
+  data = sim
+)
+coefs <- coeftest(modFixedCovs,vcov.=vcovHC,type="HC1" ) 
+coefs[grep("condition", rownames(coefs)), "Std. Error"]
+
+which(is.na(sim$prior_percent_correct))
+which(is.na(sim$true_outcome))
+sim = sim %>% filter(!is.na(true_outcome))
+covs_performance <- sim %>%
+  ungroup() %>%
+  select(
+    student_class_id,
+    prior_percent_correct
+  )
+
+LOOP_performance_kfold = loop(sim$true_outcome,sim$condition,covs_performance,pred = loopOrderedloop)
+LOOP_performance_kfold
+
+covs_performance <- sim %>%
+  ungroup() %>%
+  select(
+    # student_class_id,
+    prior_percent_correct
+  )
+LOOP_performance = loop(sim$true_outcome,sim$condition,covs_performance)#,pred = loop_loopOrdered)
+LOOP_performance
+```
+
+need to know colnames' meaning -- DONE
+
+# real data
+```{r}
+fake_data = data
+fake_data$treatment = rbinom(nrow(fake_data),1,0.5)
+fake_data = fake_data %>% filter(!is.na(prior_percent_correct))
+
+ttest <- lm(
+  inv_mastery_speed ~ treatment,
+  data = fake_data
+)
+coefs <- summary(ttest)$coefficients
+coefs[grep("treatment", rownames(coefs)), "Std. Error"]
+
+modFixedCovs <- lm(
+  inv_mastery_speed ~ treatment 
+  + student_class_id
+  + prior_percent_correct
+  + prior_completion,
+  data = fake_data
+)
+coefs <- coeftest(modFixedCovs,vcov.=vcovHC,type="HC1" ) 
+coefs[grep("treatment", rownames(coefs)), "Std. Error"]
+
+covs_performance <- fake_data %>%
+  ungroup() %>%
+  select(
+    student_class_id,
+    prior_percent_correct,
+    prior_completion
+  )
+LOOP_performance_kfold = loop(fake_data$inv_mastery_speed,fake_data$treatment,covs_performance,pred = loopOrderedloop)
+LOOP_performance_kfold
+
+covs_performance <- fake_data %>%
+  ungroup() %>%
+  select(
+    # student_class_id,
+    prior_percent_correct,
+    prior_completion
+  )
+LOOP_performance = loop(fake_data$inv_mastery_speed,fake_data$treatment,covs_performance)
+LOOP_performance
+```
+
+```{r}
+rf_prior_percent_correct = randomForest::randomForest(inv_mastery_speed~prior_percent_correct,data=fake_data[fake_data$treatment==1,])
+rf_prior_percent_correct
+rf_prior_percent_correct_prior_completion = randomForest::randomForest(inv_mastery_speed~prior_percent_correct + prior_completion,data=fake_data[fake_data$treatment==1,])
+rf_prior_percent_correct_prior_completion
+```
